@@ -14,5 +14,5 @@ coll=COLLECT(exe,a.binaries,a.datas,strip=False,upx=False,name='ServoStudio')
 if sys.platform=='darwin':
     app=BUNDLE(coll,name='ServoStudio.app',icon=None,
                bundle_identifier='com.pablonunez19.servostudio',
-               info_plist={'CFBundleShortVersionString':'0.2.0',
+               info_plist={'CFBundleShortVersionString':'0.3.0',
                            'NSHighResolutionCapable':True})

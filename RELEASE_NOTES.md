@@ -1,3 +1,12 @@
+# Servo Studio v0.3.0
+
+- Firmware-aware CAN protocol panel with supported modes and current connection details.
+- Read-only discovery and Hitec register transport for CAN 2.0A and CAN 2.0B.
+- Explicit protocol save workflow for recognized compatible /A and /C firmware, with power-cycle/reconnect instructions.
+- DroneCAN-only /U firmware correctly disables unsupported modes even when its ignored mode register reads zero.
+- Simulator supports protocol changes; hardware mode changes on /A and /C remain bench-unverified. Physical checks cover the MDB961 1.6(2) /U only.
+- Hitec register access is supported; a full DroneCAN network controller and CAN FD are not implemented.
+
 Servo Studio v0.2.0 preview
 
 New in this release:

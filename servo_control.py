@@ -16,15 +16,27 @@ class Servo:
         self.bus = DPCDriver(port)
         self.actuator_id = 0
         self.node_id = None
+        self.protocol = "dronecan"
+        self.can_id = 0
         try:
-            self.actuator_id = self.read(0x32)
-            if not 0 <= self.actuator_id <= 127:
+            # Read-only discovery: Hitec's DroneCAN register access, then
+            # standard/extended Hitec CAN. Never probe by writing registers.
+            for protocol in ('dronecan', 'can2a', 'can2b'):
+                self.protocol = protocol
+                try:
+                    self.actuator_id = self.read(0x32)
+                    break
+                except TimeoutError:
+                    if protocol == 'can2b': raise
+            if not 1 <= self.actuator_id <= (127 if self.protocol=='dronecan' else 255):
                 raise RuntimeError('Invalid actuator ID')
         except BaseException:
             self.bus.close()
             raise
 
     def read(self, address):
+        if self.protocol != 'dronecan':
+            return self._read_can(address)
         # Drain old replies so an earlier value cannot satisfy this query.
         for _ in range(100):
             if self.bus.receive(0) is None:
@@ -53,7 +65,32 @@ class Servo:
         self.node_id = replies[0][0]
         return replies[0][2]
 
+    def _read_can(self, address):
+        for _ in range(100):
+            if self.bus.receive(0) is None: break
+        extended = self.protocol == 'can2b'
+        self.bus.send(self.can_id, bytes([ord('r'), self.actuator_id, address]), extended=extended)
+        deadline = time.monotonic() + .7
+        replies = set()
+        while time.monotonic() < deadline:
+            frame = self.bus.receive(min(.05, max(0, deadline-time.monotonic())))
+            if frame is None or frame.extended != extended: continue
+            data = frame.data
+            if len(data)!=5 or data[0]!=ord('v') or data[2]!=address: continue
+            if self.actuator_id and data[1]!=self.actuator_id: continue
+            if self.node_id is not None and frame.id!=self.can_id: continue
+            replies.add((frame.id,data[1],int.from_bytes(data[3:5],'little')))
+            if self.node_id is not None: return next(iter(replies))[2]
+        if not replies: raise TimeoutError('No Hitec '+self.protocol+' reply; check protocol, power and CAN wiring')
+        if len(replies)!=1: raise RuntimeError('Multiple or inconsistent CAN replies. Connect only one servo.')
+        self.can_id, ident, value = next(iter(replies))
+        self.node_id = self.can_id
+        return value
+
     def _write(self, address, value):
+        if self.protocol != 'dronecan':
+            self.bus.send(self.can_id,bytes([ord('w'),self.actuator_id,address,value & 255,(value >> 8) & 255]),extended=self.protocol=='can2b')
+            return
         self.bus.send(CAN_COMMAND_ID, bytes([self.actuator_id, address, value & 255, (value >> 8) & 255, 192]), extended=True)
 
     def status(self):

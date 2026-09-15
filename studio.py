@@ -6,6 +6,7 @@ import os
 import time
 import uuid
 import hardware_settings as hw
+import can_protocol as cp
 from app_paths import user_data_dir
 from pathlib import Path
 from server import Control, SimServo, TICKS_PER_DEGREE
@@ -132,7 +133,7 @@ class StudioServo(SimServo):
 class StudioControl(Control):
     extra_actions = ('settings/apply','settings/save','settings/reload','settings/reset',
                      'sim/power-cycle','sim/fault','sim/signal-loss','presets/add',
-                     'presets/remove','presets/update','presets/move','sequence','center','profile/import','settings/read','settings/capture')
+                     'presets/remove','presets/update','presets/move','sequence','center','profile/import','settings/read','settings/capture','protocol/change')
 
     def __init__(self, simulated=False, port=None, data_dir=None):
         self.saved = dict(DEFAULTS)
@@ -143,6 +144,8 @@ class StudioControl(Control):
         self.hardware_baseline = None
         self.hardware_identity = None
         self.hardware_config_error = None
+        self.protocol_info = None
+        self.protocol_pending = None
         self.flash_state = 'unknown'
         self.data_dir = Path(data_dir) if data_dir else user_data_dir()/('simulation' if simulated else 'hardware')
         self.storage_error = None
@@ -150,6 +153,7 @@ class StudioControl(Control):
             raw=json.loads((self.data_dir/'workspace.json').read_text())
             self.saved=validate_settings(raw['saved'],DEFAULTS)
             self.presets=self.validate_presets(raw.get('presets',[]))
+            if simulated and raw.get('protocol') in cp.MODES:self.protocol_pending=raw['protocol']
         except FileNotFoundError: pass
         except (ValueError,KeyError,OSError,TypeError) as exc:
             self.storage_error=f'Workspace could not be loaded: {exc}'
@@ -175,7 +179,7 @@ class StudioControl(Control):
         presets=self.presets if presets is None else presets
         self.data_dir.mkdir(parents=True,exist_ok=True)
         temp=self.data_dir/'workspace.tmp'
-        temp.write_text(json.dumps(dict(saved=saved,presets=presets),indent=2,allow_nan=False))
+        temp.write_text(json.dumps(dict(saved=saved,presets=presets,protocol=self.protocol_pending if self.simulated else None),indent=2,allow_nan=False))
         os.replace(temp,self.data_dir/'workspace.json')
 
     def event(self, text):
@@ -188,6 +192,7 @@ class StudioControl(Control):
             dict(name='Angle control, Min / Max, speed and release',status='available'),
             dict(name='Named presets and repeatable motion tests',status='available'),
             dict(name='Travel, center, speed, deadband, output and overload settings',status='available on verified MDB961 firmware'),
+            dict(name='CAN protocol detection and firmware-aware selection',status='available; mode changes require compatible firmware and power cycle'),
             dict(name='Direction, fail-safe and CAN identity writes',status='simulation only'),
             dict(name='Fail-safe, protection and connection settings',status='simulation only'),
             dict(name='Profiles, simulated save / reboot / reset',status='simulation only'),
@@ -213,6 +218,10 @@ class StudioControl(Control):
         with self.lock:
             if self.reserved or self.stop.is_set():raise RuntimeError('Another operation is active. Stop it or wait for completion.')
             if not self.state['connected']:raise RuntimeError('Connect the servo first')
+            if action=='protocol/change':
+                cp.validate_change(self.protocol_info,payload.get('protocol'))
+                if payload.get('acknowledge_save') is not True:raise ValueError('Acknowledge saving all current settings and the required power cycle')
+                if payload.get('revision')!=self.config_revision:raise RuntimeError('Settings changed. Reload before changing protocol.')
             cfg=self.state['config']
             if not self.simulated and action in ('settings/apply','settings/save','settings/reload','settings/capture','profile/import','center') and self.hardware_config is None:
                 raise RuntimeError(self.hardware_config_error or 'Hardware configuration unavailable')
@@ -288,6 +297,19 @@ class StudioControl(Control):
 
     def on_connect(self):
         if self.simulated:
+            mode=self.protocol_pending or 'dronecan'
+            self.protocol_info=dict(firmware=cp.firmware(3062),supported=list(cp.MODES),configured=mode,
+                transport=mode,mode_register=cp.REG_MODES[mode],can_id=10,switchable=True,
+                reason='Simulation: changing protocol performs a virtual save and power cycle.',bitrate_code=0)
+        else:
+            try:self.protocol_info=cp.inspect(self.servo)
+            except Exception as exc:self.protocol_info=dict(supported=[],switchable=False,reason=str(exc))
+        if not self.simulated and self.protocol_pending:
+            if self.protocol_info.get('configured')!=self.protocol_pending or self.protocol_info.get('transport')!=self.protocol_pending:
+                raise RuntimeError('New protocol is not active yet. Power-cycle the servo and reconnect.')
+            self.protocol_pending=None
+        self.update(protocol_info=copy.deepcopy(self.protocol_info),protocol_pending=None)
+        if self.simulated:
             self.servo.apply(self.saved)
             # Initial virtual position lies within the saved profile.
             self.servo.values[12]=max(self.servo.values[178],min(self.servo.values[176],self.servo.values[12]))
@@ -302,6 +324,51 @@ class StudioControl(Control):
         self.event('Simulator connected' if self.simulated else 'Servo connected')
 
     def perform(self, action, payload):
+        if action=='protocol/change':
+            target=payload['protocol']
+            cp.validate_change(self.protocol_info,target)
+            self.check_stop()
+            if self.simulated:
+                self.protocol_pending=target
+                self.persist(saved=self.servo.config)
+                self.saved=dict(self.servo.config)
+                self.servo.release()
+                self.protocol_info.update(configured=target,transport=target,mode_register=cp.REG_MODES[target])
+                self.config_revision+=1
+                self.update(protocol_info=copy.deepcopy(self.protocol_info),holding=False,phase='released')
+                self.telemetry()
+                self.event('Simulated protocol save and power cycle: '+cp.MODES[target])
+                return
+            fresh=cp.inspect(self.servo)
+            if fresh!=self.protocol_info:raise RuntimeError('Protocol settings changed. Reconnect before switching.')
+            cp.validate_change(fresh,target)
+            self.cancel_live()
+            self.servo.release()
+            self.update(holding=False)
+            previous=fresh['mode_register']
+            try:
+                self.check_stop()
+                self.servo._write(0x6a,cp.REG_MODES[target])
+                if self.servo.read(0x6a)!=cp.REG_MODES[target]:raise RuntimeError('Servo rejected the protocol setting')
+                self.check_stop()
+            except Exception:
+                self.servo._write(0x6a,previous)
+                if self.servo.read(0x6a)!=previous:raise RuntimeError('Protocol rollback could not be verified; reconnect with Hitec')
+                raise
+            # Saving commits all device settings. Never reset or resume motion
+            # automatically; the operator power-cycles and explicitly reconnects.
+            try:
+                self.servo._write(0x70,65535)
+                time.sleep(1)
+            finally:
+                self.servo.close()
+                self.servo=None
+                self.protocol_pending=target
+                self.hardware_config=None
+                self.update(connected=False,config=None,holding=False,protocol_pending=target,
+                    phase='power-cycle required',updated_at=None)
+            self.event('Protocol save sent. Power-cycle the servo, then click Connect to verify '+cp.MODES[target])
+            return
         if action not in self.extra_actions:
             self.event(f'Move requested: {payload.get("angle",action)}')
             super().perform(action,payload)

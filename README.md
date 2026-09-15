@@ -138,3 +138,34 @@ The serial transport now uses pySerial instead of macOS-only termios calls. Port
 `POST /api/live` accepts `{"angle":150,"stream":"unique-client-session","seq":1,"speed":"slow","hold":true}`. Increase seq for each request. Only the owning stream may retarget its active live move; regular moves and sequences reject competing live requests. When a move is finishing, HTTP 409 tells the client to retry its latest target. A stale seq is rejected. Stop can include `{"stream":"unique-client-session"}` to invalidate requests even if none has arrived yet; create a new stream ID for later input.
 
 `POST /api/settings/capture` accepts `{"field":"center_deg","revision":1}`. Fields are `min_deg`, `max_deg`, or `center_deg`. Read config_revision from status first. The worker reads the encoder and uses the usual validated configuration-write path.
+
+### CAN protocol selection
+
+Configure → **CAN protocol** shows the detected firmware, configured protocol and
+supported choices. Servo Studio discovers one servo with read-only Hitec register
+queries over DroneCAN-style extended frames, then CAN 2.0A (11-bit) and CAN 2.0B
+(29-bit) custom register messages. The CAN 2.0A/B paths have automated packet tests;
+physical validation so far covers the MDB961 **1.6(2) /U** variant only.
+
+**This /U servo is DroneCAN-only.** Its mode register reads zero but is ignored by
+that firmware; zero must not be interpreted as CAN 2.0A support. The app disables
+unsupported modes. It uses Hitec register access, not a full DroneCAN controller
+with node discovery, heartbeats and standard ArrayCommand control. CAN FD is not
+supported.
+
+On recognized /A and /C firmware versions 1.4 through 2.3, changing protocol requires
+acknowledging that **all current device settings are saved**. The app releases the
+motor, writes and verifies the mode, sends the flash save, and disconnects. Power-cycle
+the servo and click Connect; motion does not resume automatically. /C supports A/B;
+/A supports A/B/DroneCAN. Existing CAN IDs must fit the destination protocol. This
+feature does not rewrite IDs, flash firmware, or convert /U firmware into /A firmware.
+Use only one servo on this bench connection. The simulator can exercise all choices
+without hardware and performs a virtual save/reboot.
+
+API: `POST /api/protocol/change` with `protocol` (`can2a`, `can2b`, `dronecan`),
+current `revision`, and `acknowledge_save: true`. Status includes `protocol_info`
+and `protocol_pending`. Unsupported choices are rejected by the server too.
+
+References: [Hitec protocol manual v2.5](https://www.hiteccs.com/public/uploads/ckeditor/69f10885c7bb61777404037.pdf).
+Legacy firmware value 21062 is decoded as 1.6(2) /U using the decoder in Hitec's
+2024-04-03 configuration app; the newer manual describes a different /U offset.
