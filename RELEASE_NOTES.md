@@ -1,4 +1,10 @@
-Servo Studio's first portable preview release.
+Servo Studio v0.2.0 preview
+
+New in this release:
+- Live slider movement: changes retarget the servo immediately without a backlog.
+- Typed angles move after one second of inactivity. Move now sends immediately.
+- Stop invalidates late live requests; live control cannot interrupt another tab or a sequence.
+- Set to current position buttons for Minimum, Maximum and Center read the encoder and apply that setting. Saving to flash remains separate.
 
 Download the archive for your operating system, extract it fully, and launch ServoStudio. macOS users choose Apple Silicon (arm64) or Intel (x64). Windows and Linux builds are x64. The launcher opens the authenticated local browser panel automatically; no Python installation is needed.
 

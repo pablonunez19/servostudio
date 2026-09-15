@@ -63,11 +63,16 @@ class Control:
         self.quit = threading.Event()
         self.servo = None
         self.reserved = False
+        self.live_target = None
+        self.live_stream = None
+        self.live_seq = -1
+        self.live_accepting = False
+        self.cancelled_streams = set()
         self.state = dict(connected=False, busy=False, phase='disconnected',
                           holding=None, error=None, position_deg=None,
                           min_deg=None, max_deg=None, target_deg=None,
                           voltage_v=None, updated_at=None, job_id=None,
-                          simulation=simulated)
+                          simulation=simulated, operation=None, live_stream=None)
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
@@ -81,7 +86,7 @@ class Control:
 
     def submit(self, action, payload=None):
         payload = payload or {}
-        if action not in ('connect', 'move', 'min', 'max'):
+        if action not in ('connect', 'move', 'min', 'max', 'live'):
             raise ValueError('Unknown command')
         if action != 'connect':
             speed = payload.get('speed', 'fast')
@@ -89,28 +94,52 @@ class Control:
                 raise ValueError('speed must be slow, normal, or fast')
             if not isinstance(payload.get('hold', True), bool):
                 raise ValueError('hold must be true or false')
-            if action == 'move':
+            if action in ('move','live'):
                 angle = payload.get('angle')
                 if isinstance(angle, bool) or not isinstance(angle, (int, float)) or not math.isfinite(angle):
                     raise ValueError('angle must be a finite number in degrees')
+        if action=='live':
+            stream=payload.get('stream');seq=payload.get('seq')
+            if not isinstance(stream,str) or not 1<=len(stream)<=80 or type(seq) is not int or seq<0:
+                raise ValueError('Live input requires stream and a nonnegative integer seq')
         with self.lock:
+            if action=='live':
+                if stream in self.cancelled_streams:raise RuntimeError('Live input cancelled; start a new stream')
+                if not self.state['connected']:raise RuntimeError('Connect the servo first')
+                ticks=round(payload['angle']*TICKS_PER_DEGREE)
+                if not self.state['min_ticks']<=ticks<=self.state['max_ticks']:raise ValueError('Angle is outside saved limits')
+                if stream==self.live_stream and seq<=self.live_seq:raise RuntimeError('Stale live target rejected')
+                if self.reserved and self.state['operation']=='live' and stream==self.live_stream and not self.stop.is_set():
+                    if not self.live_accepting:raise RuntimeError('Live move is finishing; retry latest target')
+                    self.live_target=ticks;self.live_seq=seq
+                    return self.state['job_id']
             if self.reserved or self.stop.is_set():
                 raise RuntimeError('Another operation is active. Stop it or wait for completion.')
             if action == 'connect' and self.state['connected']:
                 raise RuntimeError('Already connected')
             if action != 'connect' and not self.state['connected']:
                 raise RuntimeError('Connect the servo first')
-            if action == 'move':
+            if action in ('move','live'):
                 ticks = round(payload['angle']*TICKS_PER_DEGREE)
                 if not self.state['min_ticks'] <= ticks <= self.state['max_ticks']:
                     raise ValueError('Angle is outside the saved servo limits')
             self.reserved = True
             job_id = uuid.uuid4().hex
-            self.state.update(busy=True, error=None, job_id=job_id, phase='queued')
+            self.state.update(busy=True, error=None, job_id=job_id, phase='queued',operation=action,live_stream=payload.get('stream') if action=='live' else None)
+            if action=='live':
+                self.live_stream=stream;self.live_seq=seq;self.live_target=ticks;self.live_accepting=True
             self.jobs.put((action, dict(payload), job_id))
         return job_id
 
+    def cancel_live(self, stream=None):
+        with self.lock:
+            for value in (stream,self.live_stream):
+                if isinstance(value,str) and len(value)<=80:self.cancelled_streams.add(value)
+            self.live_target=None
+            self.live_accepting=False
+
     def release(self):
+        self.cancel_live()
         self.stop.set()
         self.update(phase='stopping')
 
@@ -182,7 +211,24 @@ class Control:
                     raise RuntimeError('Voltage or servo fault during movement')
                 if not min(origin,goal)-91 <= pos <= max(origin,goal)+91:
                     raise RuntimeError('Unexpected travel')
+                if action=='live':
+                    with self.lock:
+                        newest=self.live_target
+                        self.live_target=None
+                    if newest is not None and newest!=goal:
+                        if not low<=newest<=high:raise RuntimeError('Live target is outside limits')
+                        origin=pos;goal=newest
+                        self.check_stop()
+                        self.servo._write(30,goal)
+                        if self.servo.read(30)!=goal:raise RuntimeError('Live target rejected')
+                        self.update(target_deg=goal/TICKS_PER_DEGREE)
+                        deadline=time.monotonic()+abs(goal-pos)/TICKS_PER_DEGREE/minimum_speed+5
+                        # Retargeting does not reset the stall watchdog.
                 if abs(pos-goal) <= max(15, int(getattr(self, 'hardware_config', None).get('deadband_ticks',0))+1 if getattr(self, 'hardware_config', None) else 15):
+                    with self.lock:
+                        if action=='live' and self.live_target is not None:
+                            continue
+                        self.live_accepting=False
                     success = True
                     break
                 if abs(pos-progress_pos) >= 10:
@@ -193,6 +239,7 @@ class Control:
             if not success:
                 raise TimeoutError('Target not reached')
         finally:
+            with self.lock:self.live_accepting=False
             keep_holding = success and hold and not self.stop.is_set() and not self.quit.is_set()
             try:
                 if not keep_holding:
@@ -218,6 +265,7 @@ class Control:
         self.move(action, payload)
 
     def _fail(self, exc):
+        self.cancel_live()
         release_ok = False
         if self.servo:
             try:
@@ -280,6 +328,7 @@ class Control:
                 with self.lock:
                     self.reserved = False
                     self.state['busy'] = False
+                    self.state['operation'] = None
         if self.servo:
             try: self.servo.release()
             finally: self.servo.close()
@@ -345,10 +394,11 @@ def make_handler(control, token):
                     threading.Thread(target=self.server.shutdown,daemon=True).start()
                     return
                 if self.path == '/api/release':
+                    control.cancel_live(payload.get('stream'))
                     control.release()
                     return self.send_json(202,{'accepted':True})
                 action = self.path.removeprefix('/api/')
-                if self.path != '/api/'+action or action not in ('connect','move','min','max')+getattr(control,'extra_actions',()):
+                if self.path != '/api/'+action or action not in ('connect','move','min','max','live')+getattr(control,'extra_actions',()):
                     return self.send_json(404,{'error':'Not found'})
                 job = control.submit(action,payload)
                 self.send_json(202,{'accepted':True,'job_id':job})

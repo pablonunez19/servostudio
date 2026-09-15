@@ -62,7 +62,7 @@ Keep the server terminal open. Use the access-key link printed there; a new key 
 
 ## Control and named positions
 
-Enter an angle, move to Min / Max / Center, or jog by 1°. Named positions support **Save**, **Edit**, **Move**, and **Remove**. They are stored on this Mac, separately for hardware (`hardware/workspace.json`) and simulation (`simulation/workspace.json`) under the application data directory. A named position does not change the servo's travel limits.
+Dragging the angle slider sends movement immediately. Typing a valid angle sends it after a one-second pause; **Move now** skips that pause. New input replaces the active live target instead of queuing old positions. Stop cancels pending typing and invalidates late live requests. Switching tabs or hiding the page cancels unsent edits; an accepted movement still completes unless stopped. You can also move to Min / Max / Center or jog by 1°. Named positions support **Save**, **Edit**, **Move**, and **Remove**. They are stored on this Mac, separately for hardware (`hardware/workspace.json`) and simulation (`simulation/workspace.json`) under the application data directory. A named position does not change the servo's travel limits.
 
 Fast uses the current configured speed limit. Slow and Medium temporarily cap it at the previous tested slow/medium values. The configured speed is restored after each move. Hold after moving keeps torque enabled. Stop & release cancels pending motion and removes holding torque through the USB/CAN link. It is not a hardware emergency stop. Closing a browser does not cancel a sequence or release holding. Control-C in the server terminal attempts release before shutdown.
 
@@ -78,6 +78,8 @@ Editable hardware fields:
 - Motor output limit (%)
 - Acceleration time (ms)
 - Overload delay (s) and output during overload (%)
+
+**Set to current position**, beside Minimum, Maximum and Center, reads the current encoder position and applies just that field. It does not copy the requested target or save to flash. Apply or reload any other manual edits first. Normal validation still applies: the center must remain within the travel range and minimum must stay below maximum.
 
 **Apply settings** releases the motor, validates the complete configuration, writes only changes, and reads them back. If a write fails, it attempts to restore previous values and reports any unverified rollback. New travel limits must include the current shaft position and center. Move inside the proposed range first if necessary.
 
@@ -130,3 +132,9 @@ Live checks on the connected servo passed: configuration readout, temporary spee
 ## Portable build validation
 
 The serial transport now uses pySerial instead of macOS-only termios calls. Port selection prefers DPC-20/AT32 identification and rejects ambiguous USB devices. Packaged tests verify bundled HTML, authentication, simulator movement and shutdown without touching USB. The original physical checks above used the previous native macOS transport; they do not establish Windows/Linux hardware validation.
+
+## Live control API
+
+`POST /api/live` accepts `{"angle":150,"stream":"unique-client-session","seq":1,"speed":"slow","hold":true}`. Increase seq for each request. Only the owning stream may retarget its active live move; regular moves and sequences reject competing live requests. When a move is finishing, HTTP 409 tells the client to retry its latest target. A stale seq is rejected. Stop can include `{"stream":"unique-client-session"}` to invalidate requests even if none has arrived yet; create a new stream ID for later input.
+
+`POST /api/settings/capture` accepts `{"field":"center_deg","revision":1}`. Fields are `min_deg`, `max_deg`, or `center_deg`. Read config_revision from status first. The worker reads the encoder and uses the usual validated configuration-write path.

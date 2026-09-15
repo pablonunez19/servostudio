@@ -132,7 +132,7 @@ class StudioServo(SimServo):
 class StudioControl(Control):
     extra_actions = ('settings/apply','settings/save','settings/reload','settings/reset',
                      'sim/power-cycle','sim/fault','sim/signal-loss','presets/add',
-                     'presets/remove','presets/update','presets/move','sequence','center','profile/import','settings/read')
+                     'presets/remove','presets/update','presets/move','sequence','center','profile/import','settings/read','settings/capture')
 
     def __init__(self, simulated=False, port=None, data_dir=None):
         self.saved = dict(DEFAULTS)
@@ -214,8 +214,11 @@ class StudioControl(Control):
             if self.reserved or self.stop.is_set():raise RuntimeError('Another operation is active. Stop it or wait for completion.')
             if not self.state['connected']:raise RuntimeError('Connect the servo first')
             cfg=self.state['config']
-            if not self.simulated and action in ('settings/apply','settings/save','settings/reload','profile/import','center') and self.hardware_config is None:
+            if not self.simulated and action in ('settings/apply','settings/save','settings/reload','settings/capture','profile/import','center') and self.hardware_config is None:
                 raise RuntimeError(self.hardware_config_error or 'Hardware configuration unavailable')
+            if action=='settings/capture':
+                if payload.get('field') not in ('min_deg','max_deg','center_deg'):raise ValueError('Capture field must be min_deg, max_deg or center_deg')
+                if payload.get('revision')!=self.config_revision:raise RuntimeError('Settings changed. Reload the form before capturing.')
             if action=='settings/apply':
                 (validate_settings if self.simulated else hw.validate)(payload.get('settings'),cfg)
                 if payload.get('revision')!=self.config_revision:raise RuntimeError('Settings changed. Reload the form before applying.')
@@ -239,7 +242,7 @@ class StudioControl(Control):
                 if type(payload.get('hold',True)) is not bool:raise ValueError('hold must be true or false')
             job=uuid.uuid4().hex
             self.reserved=True
-            self.state.update(busy=True,error=None,job_id=job,phase='queued')
+            self.state.update(busy=True,error=None,job_id=job,phase='queued',operation=action,live_stream=None)
             self.jobs.put((action,copy.deepcopy(payload),job))
             return job
 
@@ -310,7 +313,11 @@ class StudioControl(Control):
             self.hardware_settings_action(action,payload)
             self.telemetry()
             return
-        if action=='settings/read':
+        if action=='settings/capture':
+            cfg=validate_settings({payload['field']:servo.read(12)/TICKS_PER_DEGREE},servo.config)
+            self.apply_config(cfg)
+            self.event('Current encoder position applied to '+payload['field']+'; not saved to flash')
+        elif action=='settings/read':
             self.config_revision+=1
         elif action=='settings/apply':
             cfg=validate_settings(payload['settings'],servo.config)
@@ -379,7 +386,11 @@ class StudioControl(Control):
 
     def hardware_settings_action(self, action, payload):
         servo=self.servo
-        if action=='settings/read':
+        if action=='settings/capture':
+            self.hardware_config=hw.apply(servo,{payload['field']:servo.read(12)/TICKS_PER_DEGREE},self.hardware_config)
+            self.update(holding=False)
+            self.event('Current encoder position applied to '+payload['field']+'; not saved to flash')
+        elif action=='settings/read':
             if self.hardware_identity!=hw.IDENTITY:raise RuntimeError('Unsupported hardware identity')
             self.hardware_config=hw.read(servo)
             self.hardware_config_error=None
