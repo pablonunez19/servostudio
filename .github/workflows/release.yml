@@ -1,0 +1,73 @@
+name: Build and release Servo Studio
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            platform: windows-x64
+            executable: dist/ServoStudio/ServoStudio.exe
+          - os: ubuntu-22.04
+            platform: linux-x64
+            executable: dist/ServoStudio/ServoStudio
+          - os: macos-14
+            platform: macos-arm64
+            executable: dist/ServoStudio.app/Contents/MacOS/ServoStudio
+          - os: macos-15-intel
+            platform: macos-x64
+            executable: dist/ServoStudio.app/Contents/MacOS/ServoStudio
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-build.txt
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Build standalone app
+        run: python -m PyInstaller --noconfirm --clean ServoStudio.spec
+      - name: Ad-hoc sign macOS bundle
+        if: runner.os == 'macOS'
+        run: python scripts/sign_macos.py
+      - name: Test packaged app (no hardware)
+        run: ${{ matrix.executable }} --self-test
+      - name: Package archive and checksum
+        run: python scripts/package_release.py --platform ${{ matrix.platform }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: release/*
+          if-no-files-found: error
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Publish prerelease after every build succeeds
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || gh release create "$RELEASE_TAG" --verify-tag --draft --prerelease --title "Servo Studio $RELEASE_TAG" --notes-file RELEASE_NOTES.md
+          gh release upload "$RELEASE_TAG" release/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease
